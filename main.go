@@ -1,11 +1,24 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 )
+
+var rdb *redis.Client
+
+func init() {
+	rdb = redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0,
+	})
+}
 
 type Book struct {
 	ID     int    `json:"id"`
@@ -24,24 +37,57 @@ func main() {
 	r.POST("/books", createBook)
 	r.PUT("/books/:id", updateBook)
 	r.DELETE("/books/:id", deleteBook)
+	r.DELETE("/clear-redis", clearRedis)
 
 	r.Run(":8080")
 }
 
 func getBooks(c *gin.Context) {
-	c.JSON(http.StatusOK, books)
+
+	keys, err := rdb.Keys(context.Background(), "book:*").Result()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get books from Redis"})
+		return
+	}
+
+	var bookList []Book
+	for _, key := range keys {
+		bookJSON, err := rdb.HGetAll(context.Background(), key).Result()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get book data from Redis"})
+			return
+		}
+
+		var book Book
+		if err := json.Unmarshal([]byte(bookJSON["data"]), &book); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unmarshal book data"})
+			return
+		}
+
+		bookList = append(bookList, book)
+	}
+
+	c.JSON(http.StatusOK, bookList)
 }
 
 func getBook(c *gin.Context) {
 	id, _ := strconv.Atoi(c.Param("id"))
-	for _, book := range books {
-		if book.ID == id {
-			c.JSON(http.StatusOK, book)
-			return
-		}
+	bookJSON, err := rdb.HGet(context.Background(), "book:"+strconv.Itoa(id), "data").Result()
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Book not found"})
+		return
 	}
-	c.JSON(http.StatusNotFound, gin.H{"error": "Book not found"})
+
+	var book Book
+	if err := json.Unmarshal([]byte(bookJSON), &book); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unmarshal book data"})
+		return
+	}
+
+	c.JSON(http.StatusOK, book)
 }
+
+var nextBookIDKey = "next_book_id"
 
 func createBook(c *gin.Context) {
 	var newBook Book
@@ -50,8 +96,21 @@ func createBook(c *gin.Context) {
 		return
 	}
 
-	newBook.ID = len(books) + 1
-	books = append(books, newBook)
+	id, err := rdb.Incr(context.Background(), nextBookIDKey).Result()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate book ID"})
+		return
+	}
+	newBook.ID = int(id)
+	bookJSON, err := json.Marshal(newBook)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal book data"})
+		return
+	}
+	if err := rdb.HSet(context.Background(), "book:"+strconv.Itoa(newBook.ID), "data", string(bookJSON)).Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save book to Redis"})
+		return
+	}
 	c.JSON(http.StatusCreated, newBook)
 }
 
@@ -63,24 +122,55 @@ func updateBook(c *gin.Context) {
 		return
 	}
 
-	for i, book := range books {
-		if book.ID == id {
-			books[i] = updatedBook
-			c.JSON(http.StatusOK, updatedBook)
-			return
-		}
+	// Check if book exists
+	_, err := rdb.HGet(context.Background(), "book:"+strconv.Itoa(id), "data").Result()
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Book not found"})
+		return
 	}
-	c.JSON(http.StatusNotFound, gin.H{"error": "Book not found"})
+
+	//fmt.Println("ID:", strconv.Itoa(id))
+
+	// Update book
+	updatedBook.ID = id
+	bookJSON, err := json.Marshal(updatedBook)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal book data"})
+		return
+	}
+	if err := rdb.HSet(context.Background(), "book:"+strconv.Itoa(id), "data", string(bookJSON)).Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update book in Redis"})
+		return
+	}
+
+	c.JSON(http.StatusOK, updatedBook)
 }
 
 func deleteBook(c *gin.Context) {
 	id, _ := strconv.Atoi(c.Param("id"))
-	for i, book := range books {
-		if book.ID == id {
-			books = append(books[:i], books[i+1:]...)
-			c.JSON(http.StatusOK, gin.H{"message": "Book deleted"})
-			return
-		}
+
+	// Check if book exists
+	_, err := rdb.HGet(context.Background(), "book:"+strconv.Itoa(id), "data").Result()
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Book not found"})
+		return
 	}
-	c.JSON(http.StatusNotFound, gin.H{"error": "Book not found"})
+
+	// Delete book
+	if err := rdb.Del(context.Background(), "book:"+strconv.Itoa(id)).Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete book from Redis"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Book deleted"})
+}
+
+func clearRedis(c *gin.Context) {
+	// Flush the Redis database
+	if err := rdb.FlushDB(context.Background()).Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to clear Redis storage"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Redis storage cleared"})
 }
