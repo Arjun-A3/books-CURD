@@ -167,6 +167,34 @@ func createBook(c *gin.Context) {
 		return
 	}
 
+	// Retrieve existing book list from Redis
+	bookListStr, err := rdb.Get(context.Background(), "bookList").Result()
+	var bookList []Book
+	if err == nil {
+		// If data exists in cache, unmarshal it
+		if err := json.Unmarshal([]byte(bookListStr), &bookList); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unmarshal book list data"})
+			return
+		}
+	}
+
+	// Append the newly created book to the book list
+	bookList = append(bookList, newBook)
+
+	// Marshal the updated book list back into JSON format
+	updatedBookListJSON, err := json.Marshal(bookList)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal updated book list data"})
+		return
+	}
+
+	// Set the updated book list JSON string back into Redis
+	err = rdb.Set(context.Background(), "bookList", updatedBookListJSON, 0).Err()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update book list in Redis"})
+		return
+	}
+
 	c.JSON(http.StatusCreated, newBook)
 }
 
@@ -203,6 +231,37 @@ func updateBook(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update book data in Redis"})
 		return
 	}
+	bookListStr, err := rdb.Get(context.Background(), "bookList").Result()
+	var bookList []Book
+	if err == nil {
+		// If data exists in cache, unmarshal it
+		if err := json.Unmarshal([]byte(bookListStr), &bookList); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unmarshal book list data"})
+			return
+		}
+	}
+
+	// Find and update the book in the book list
+	for i, book := range bookList {
+		if book.ID.Hex() == id {
+			bookList[i] = updatedBook
+			break
+		}
+	}
+
+	// Marshal the updated book list back into JSON format
+	updatedBookListJSON, err := json.Marshal(bookList)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal updated book list data"})
+		return
+	}
+
+	// Set the updated book list JSON string back into Redis
+	err = rdb.Set(context.Background(), "bookList", updatedBookListJSON, 0).Err()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update book list in Redis"})
+		return
+	}
 
 	c.JSON(http.StatusOK, updatedBook)
 }
@@ -226,6 +285,39 @@ func deleteBook(c *gin.Context) {
 	err = rdb.Del(context.Background(), "book:"+id).Err()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete book data from Redis"})
+		return
+	}
+
+	// Retrieve existing book list from Redis
+	bookListStr, err := rdb.Get(context.Background(), "bookList").Result()
+	var bookList []Book
+	if err == nil {
+		// If data exists in cache, unmarshal it
+		if err := json.Unmarshal([]byte(bookListStr), &bookList); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unmarshal book list data"})
+			return
+		}
+	}
+
+	// Find and remove the deleted book from the book list
+	for i, book := range bookList {
+		if book.ID.Hex() == id {
+			bookList = append(bookList[:i], bookList[i+1:]...)
+			break
+		}
+	}
+
+	// Marshal the updated book list back into JSON format
+	updatedBookListJSON, err := json.Marshal(bookList)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal updated book list data"})
+		return
+	}
+
+	// Set the updated book list JSON string back into Redis
+	err = rdb.Set(context.Background(), "bookList", updatedBookListJSON, 0).Err()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update book list in Redis"})
 		return
 	}
 
