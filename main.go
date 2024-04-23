@@ -2,31 +2,27 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
-	"strconv"
+
+	"my-gin-project/configs"
 
 	"github.com/gin-gonic/gin"
-	"github.com/redis/go-redis/v9"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 )
 
-var rdb *redis.Client
+var DB *mongo.Client
 
 func init() {
-	rdb = redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "",
-		DB:       0,
-	})
+	DB = configs.DB
 }
 
 type Book struct {
-	ID     int    `json:"id"`
-	Title  string `json:"title"`
-	Author string `json:"author"`
+	ID     primitive.ObjectID `json:"_id,omitempty" bson:"_id,omitempty"`
+	Title  string             `json:"title"`
+	Author string             `json:"author"`
 }
-
-var books []Book
 
 func main() {
 	r := gin.Default()
@@ -37,33 +33,28 @@ func main() {
 	r.POST("/books", createBook)
 	r.PUT("/books/:id", updateBook)
 	r.DELETE("/books/:id", deleteBook)
-	r.DELETE("/clear-redis", clearRedis)
+	r.DELETE("/clear-mongodb", clearMongoDB)
 
 	r.Run(":8080")
 }
 
 func getBooks(c *gin.Context) {
+	collection := configs.GetCollection(DB, "books")
 
-	keys, err := rdb.Keys(context.Background(), "book:*").Result()
+	cursor, err := collection.Find(context.Background(), bson.M{})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get books from Redis"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get books from MongoDB"})
 		return
 	}
+	defer cursor.Close(context.Background())
 
 	var bookList []Book
-	for _, key := range keys {
-		bookJSON, err := rdb.HGetAll(context.Background(), key).Result()
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get book data from Redis"})
-			return
-		}
-
+	for cursor.Next(context.Background()) {
 		var book Book
-		if err := json.Unmarshal([]byte(bookJSON["data"]), &book); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unmarshal book data"})
+		if err := cursor.Decode(&book); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to decode book data"})
 			return
 		}
-
 		bookList = append(bookList, book)
 	}
 
@@ -71,23 +62,23 @@ func getBooks(c *gin.Context) {
 }
 
 func getBook(c *gin.Context) {
-	id, _ := strconv.Atoi(c.Param("id"))
-	bookJSON, err := rdb.HGet(context.Background(), "book:"+strconv.Itoa(id), "data").Result()
+	id := c.Param("id")
+	objectID, err := primitive.ObjectIDFromHex(id)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid book ID"})
+		return
+	}
+
+	collection := configs.GetCollection(DB, "books")
+	var book Book
+	err = collection.FindOne(context.Background(), bson.M{"_id": objectID}).Decode(&book)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Book not found"})
 		return
 	}
 
-	var book Book
-	if err := json.Unmarshal([]byte(bookJSON), &book); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unmarshal book data"})
-		return
-	}
-
 	c.JSON(http.StatusOK, book)
 }
-
-var nextBookIDKey = "next_book_id"
 
 func createBook(c *gin.Context) {
 	var newBook Book
@@ -96,50 +87,36 @@ func createBook(c *gin.Context) {
 		return
 	}
 
-	id, err := rdb.Incr(context.Background(), nextBookIDKey).Result()
+	collection := configs.GetCollection(DB, "books")
+	res, err := collection.InsertOne(context.Background(), newBook)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate book ID"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save book to MongoDB"})
 		return
 	}
-	newBook.ID = int(id)
-	bookJSON, err := json.Marshal(newBook)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal book data"})
-		return
-	}
-	if err := rdb.HSet(context.Background(), "book:"+strconv.Itoa(newBook.ID), "data", string(bookJSON)).Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save book to Redis"})
-		return
-	}
+	newBook.ID = res.InsertedID.(primitive.ObjectID)
+
 	c.JSON(http.StatusCreated, newBook)
 }
 
 func updateBook(c *gin.Context) {
-	id, _ := strconv.Atoi(c.Param("id"))
+	id := c.Param("id")
+	objectID, err := primitive.ObjectIDFromHex(id)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid book ID"})
+		return
+	}
+
 	var updatedBook Book
 	if err := c.ShouldBindJSON(&updatedBook); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	updatedBook.ID = objectID
 
-	// Check if book exists
-	_, err := rdb.HGet(context.Background(), "book:"+strconv.Itoa(id), "data").Result()
+	collection := configs.GetCollection(DB, "books")
+	_, err = collection.UpdateOne(context.Background(), bson.M{"_id": objectID}, bson.M{"$set": updatedBook})
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Book not found"})
-		return
-	}
-
-	//fmt.Println("ID:", strconv.Itoa(id))
-
-	// Update book
-	updatedBook.ID = id
-	bookJSON, err := json.Marshal(updatedBook)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal book data"})
-		return
-	}
-	if err := rdb.HSet(context.Background(), "book:"+strconv.Itoa(id), "data", string(bookJSON)).Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update book in Redis"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update book in MongoDB"})
 		return
 	}
 
@@ -147,30 +124,30 @@ func updateBook(c *gin.Context) {
 }
 
 func deleteBook(c *gin.Context) {
-	id, _ := strconv.Atoi(c.Param("id"))
-
-	// Check if book exists
-	_, err := rdb.HGet(context.Background(), "book:"+strconv.Itoa(id), "data").Result()
+	id := c.Param("id")
+	objectID, err := primitive.ObjectIDFromHex(id)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Book not found"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid book ID"})
 		return
 	}
 
-	// Delete book
-	if err := rdb.Del(context.Background(), "book:"+strconv.Itoa(id)).Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete book from Redis"})
+	collection := configs.GetCollection(DB, "books")
+	res, err := collection.DeleteOne(context.Background(), bson.M{"_id": objectID})
+	if err != nil || res.DeletedCount == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Book not found"})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "Book deleted"})
 }
 
-func clearRedis(c *gin.Context) {
-	// Flush the Redis database
-	if err := rdb.FlushDB(context.Background()).Err(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to clear Redis storage"})
+func clearMongoDB(c *gin.Context) {
+	collection := configs.GetCollection(DB, "books")
+	_, err := collection.DeleteMany(context.Background(), bson.M{})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to clear MongoDB storage"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Redis storage cleared"})
+	c.JSON(http.StatusOK, gin.H{"message": "MongoDB storage cleared"})
 }
